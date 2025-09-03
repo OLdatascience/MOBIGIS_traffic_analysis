@@ -1,0 +1,757 @@
+---
+
+title: "Analyse des données Bruxelles-Mobilité (CEE_016)"
+author: "Olivier Lebert"
+format: html
+execute:
+  freeze: true # Générer le document à chaque exécution (false) vs figer (true)
+  echo: true # Afficher ou non le code R/Python dans le document final
+  eval: true # Exécuter ou non le code dans les blocs
+  cache: true # Mémoriser ou non les résultats des blocs de code
+  warning: false # Masquer ou non les warnings dans le rapport
+  message: false # Masquer ou non les messages générés par les fonctions
+  python: env_CEE016 # Spéfcifier l'environnement Python à utiliser via reticulate
+server: shiny  
+---
+```{r}
+### Configuration de l'environnement R
+
+# Packages nécessaires
+required_packages <- c("RMariaDB", "getPass", "DBI", "dplyr", "lubridate",
+                       "tidyr", "factoextra", "FactoMineR", "tibble", "ggplot2","reticulate","quarto")
+
+install_if_missing <- function(pkgs) {
+  to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+  if (length(to_install)) install.packages(to_install)
+}
+
+install_if_missing(required_packages)
+
+# Chargement des packages
+lapply(required_packages, library, character.only = TRUE)
+
+# Forcer la langue du système à "français belgique" afin que les jours soit nommés
+# en français avec la fonction wday et s'assurer que le script fonctionne sur 
+# une autre machine (Windows) dont la langue système serait différente
+Sys.setlocale("LC_TIME", "fr_BE.UTF-8")
+
+```
+
+```{r}
+### Récupération des données sur la base de données MySQL via MariaDB()
+
+# Connexion à la base de données 
+mgr <- MariaDB()
+con <- dbConnect(mgr, 
+                host = "34.198.2.135", 
+                dbname="BikeClimate",
+                user="JDA2025",
+                password = getPass())
+
+# Lister les tables disponibles sur la bdd
+dbListTables(con)
+
+# Lister les champs disponibles dans chacune des tables de la bdd
+dbListFields(con,"uccle")
+dbListFields(con,"monitor")
+
+# Requête pour les données de la table uccle
+query1 <- "
+SELECT *
+FROM uccle
+WHERE DateUTC1 BETWEEN '2024-01-01' AND '2024-12-31'
+ORDER BY DateUTC1, hourUTC1;
+"
+data_uccle <- dbGetQuery(con,query1) 
+data_uccle
+
+# Requête pour les données de la table monitor
+query2 <- "
+SELECT *
+FROM monitor
+WHERE DateUTC1 BETWEEN '2024-01-01' AND '2024-12-31';
+"
+data_monitor <- dbGetQuery(con,query2)
+data_monitor
+unique(data_monitor$FeatureID)
+# Fusionner les deux jeux de données
+data_full <- data_monitor %>%
+  left_join(data_uccle, by = c("DateUTC1","hourUTC1"))
+
+# Vérifier
+glimpse(data_full)
+summary(data_full) # Les valeurs obtenues semblent cohérentes 
+                   # 158112 Obs = (24h * 366j * 18 bornes)
+                   # Nombre de NA généralement < 1K sauf pour wind_speed < 10K
+                   # cloud < 5K et solar < 1.5K qui restent des valeurs plausibles
+
+# Déconnexion de la db
+dbDisconnect(con)
+
+```
+
+```{r}
+###  Nettoyage des données 
+
+# Exclure les lignes ou count = NA étant notre variable à expliquer
+# Repmplir le reste des NA avec leurs moyennes par heure et par borne 
+
+data_clean <- data_full %>%
+  filter(!is.na(Count)) %>%
+  group_by(FeatureID, hourUTC1) %>%
+  mutate(
+    Speed = ifelse(is.na(Speed), mean(Speed, na.rm = TRUE),Speed),
+    Ta_ucc = ifelse(is.na(Ta_ucc), mean(Ta_ucc, na.rm = TRUE), Ta_ucc),
+    wind_speed_ucc = ifelse(is.na(wind_speed_ucc), mean(wind_speed_ucc, na.rm = TRUE), wind_speed_ucc),
+    press_ucc = ifelse(is.na(press_ucc), mean(press_ucc, na.rm = TRUE), press_ucc),
+    cloud_ucc = ifelse(is.na(cloud_ucc), round(mean(cloud_ucc, na.rm = TRUE)), cloud_ucc),
+    rain_ucc = ifelse(is.na(rain_ucc), mean(rain_ucc, na.rm = TRUE), rain_ucc),
+    solar_bxl = ifelse(is.na(solar_bxl), mean(solar_bxl, na.rm = TRUE), solar_bxl)
+  ) %>%
+  ungroup()
+
+
+
+# On vérifie s'il ne reste plus de NA 
+colSums(is.na(data_clean))
+
+
+# Ajout d'autres variables temporelles (date, jour, w-e)
+data_clean <- data_clean %>%
+  mutate(
+    date = as.POSIXct(DateUTC1, format = "%Y-%m-%d", tz = "Europe/Brussels"),
+    jour_semaine = wday(DateUTC1, label = TRUE, abbr = FALSE),
+    is_weekend = jour_semaine %in% c("samedi", "dimanche")
+  )
+
+
+```
+
+```{r}
+### Mise en forme pour PCA et CLustering 
+
+# Calcul du profil horaire moyen
+profil_horaire <- data_clean %>%
+  group_by(FeatureID, is_weekend, hourUTC1) %>%
+  summarise(mean_count = mean(Count, na.rm = TRUE), .groups = "drop")
+
+# Mise en forme pour la PCA : une ligne = une station x type de jour
+profil_matrix <- profil_horaire %>%
+  mutate(type_jour = ifelse(is_weekend, "weekend", "semaine")) %>%
+  unite("station_jour", FeatureID, type_jour, sep = "_") %>%
+  select(station_jour, hourUTC1, mean_count) %>%
+  pivot_wider(names_from = hourUTC1, values_from = mean_count, names_prefix = "h_")
+
+# On vérifie qu'on obtient bien 2 lignes pour chaque station (w-e ou semaine)
+profil_horaire %>%
+  mutate(type_jour = ifelse(is_weekend, "weekend", "semaine")) %>%
+  unite("station_jour", FeatureID, type_jour, sep = "_") %>%
+  count(station_jour) %>%
+  arrange(n)  # pour voir les lignes incomplètes
+
+
+# Préparation base R
+profil_scaled <- as.data.frame(profil_matrix)
+rownames(profil_scaled) <- profil_scaled$station_jour
+profil_scaled <- profil_scaled[, -1]  # enlever colonne station_jour
+
+# Aperçu des données
+summary(profil_scaled)
+
+# Vérifier les colonnes avec une seule valeur unique
+sapply(profil_scaled, function(x) length(unique(x[!is.na(x)])))
+
+# Vérifier le nombre de valeur distinctes 
+apply(profil_scaled, 2, function(x) length(unique(x)))
+length(unique(apply(profil_scaled, 1, paste, collapse = "-")))
+
+# Vérifier que nos écarts type sont bien différents de 0 pour l'ACP
+apply(profil_scaled, 2, sd) # 0 partout, pas un bon signe
+
+# Vérifier les types de chaque variable
+sapply(profil_scaled, class) # int64 pas reconnu par sd et scale
+
+# Transformer les int64 en numeric type
+profil_scaled <- profil_scaled %>%
+  mutate(across(everything(), ~ as.numeric(.)))
+
+# Centrer réduire 
+profil_scaled <- scale(profil_scaled)
+
+```
+
+```{r}
+# Réalisation de l’ACP avec FactoMineR
+res_pca <- PCA(profil_scaled, graph = FALSE)
+
+# Résumé et valeurs propres (règle de Kaiser)
+eig_vals <- res_pca$eig[, 1]   # valeurs propres
+eig_vals
+which(eig_vals > 1)
+
+```
+
+```{r}
+# Visualisation des valeurs propres 
+eigplot = fviz_eig(res_pca, addlabels = TRUE, 
+         main = "Valeurs propres",
+         xlab = "Composantes", ylab = "Valeur propre (Variance expliquée)")
+eigplot + geom_hline(yintercept = 100/ncol(profil_scaled), linetype = "dashed", color = "red")
+```
+
+```{r}
+# Extraction des scores (coordonnées individus)
+scores <- as.data.frame(res_pca$ind$coord)
+scores$station_jour <- rownames(scores)
+scores$type_jour <- ifelse(grepl("weekend", scores$station_jour), "weekend", "semaine")
+
+# Graphique des scores colorés selon le type de jour
+# C’est l’axe qui explique la plus grande part de la variance dans les profils horaires.
+# L'axe 1 explique plus de 77% de la variance au sein de nos données 
+# Plus on va vers la droite, plus le score sur Dim 1 est élevé.
+# Interprétation probable (vu les données horaires) :
+# Cet axe oppose les profils très marqués par les pics d’activité (heures de pointe) aux profils plus plats ou modérés.
+# Les points très à droite (ex. : CJM90_semaine, CB1101_semaine) : profils à très forte activité, notamment aux heures de pointe (matin/soir).
+# Les points à gauche : profils à usage modéré ou avec moins de pics distincts (potentiellement stations à plus faible fréquentation ou trafic plus diffus).
+
+# « Pour faciliter l’interprétation, l’axe 2 a été inversé afin de positionner les profils “week-end” en haut du graphique, mettant ainsi en évidence            l’activité nocturne caractéristique de ces jours. »
+# Cet axe sépare principalement les jours de semaine (en bas, bleu) des week-ends (en haut, rouge).
+# Contribution des variables :
+# Ce sont surtout les heures 0h-7h qui contribuent à cet axe :
+# Plus on est haut sur l’axe Dim 2 : moins d’activité la nuit (typiquement semaine)
+# Plus on est bas sur l’axe Dim 2 : plus d’activité la nuit (typiquement week-end)
+# D'abord on inverse donc la deuxième dimension pour rendre le graphique plus lisible 
+
+scores$Dim.2 <- -scores$Dim.2
+ggplot(scores, aes(x = Dim.1, y = Dim.2, label = station_jour, color = type_jour)) +
+  geom_point(size = 3) +
+  geom_text(vjust = -0.8, size = 3) +
+  theme_minimal() +
+  scale_color_manual(values = c("semaine" = "steelblue", "weekend" = "tomato")) +
+  labs(
+    title = "ACP sur les profils horaires (semaine/weekend)",
+    x = paste0("Dim 1 (", round(res_pca$eig[1, 2], 1), "%)"),
+    y = paste0("Dim 2 (", round(res_pca$eig[2, 2], 1), "%)"),
+    color = "Type de jour"
+  )
+```
+
+```{r}
+
+# Contributions des variables aux axes
+fviz_contrib(res_pca, choice = "var", axes = 1, top = 24)  # PC1 (Dim1)
+fviz_contrib(res_pca, choice = "var", axes = 2, top = 24)  # PC2 (Dim2)
+```
+
+```{r}
+# Variante sans labels sur points, seulement couleur
+ggplot(scores, aes(x = Dim.1, y = Dim.2, color = type_jour)) +
+  geom_point(size = 3) +
+  geom_text(aes(x = Dim.1, y = Dim.2, label = station_jour), vjust = -0.8, size = 3, inherit.aes = FALSE) +
+  scale_color_manual(values = c("semaine" = "steelblue", "weekend" = "tomato")) +
+  theme_minimal() +
+  labs(
+    title = "ACP sur les profils horaires (semaine/weekend)",
+    x = paste0("Dim 1 (", round(res_pca$eig[1, 2], 1), "%)"),
+    y = paste0("Dim 2 (", round(res_pca$eig[2, 2], 1), "%)"),
+    color = "Type de jour"
+  )
+```
+
+```{r}
+# Cercle de corrélation (corrélogramme des variables)
+fviz_pca_var(res_pca, col.var = "cos2", 
+             gradient.cols = c("lightblue", "blue", "red"), 
+             repel = TRUE,
+             title = "Cercle des corrélations")
+
+
+# Observer les différences de count par heures et jours
+# On constate qu'en effet, les heures de la nuit ont des counts supérieurs le w-e
+# par rapport à la semaine (PC2) et que les heures de pointes du matin et  
+# du reste de la journée de 14 à 20h expliquent davantage la variance au sein de 
+# la première composante 
+
+# En bref, PC1 = Intensité du traffic (niveau d'usage + pics heures de pointe)
+# et PC2 = Type de jour (week end vs semaine) offrant un clivage net partout
+```
+```{r}
+# On ajoute PC1 et PC2 à data_clean pour des analyses ultérieures
+# D'abord créer 'station_jour' dans data_clean pour le join
+data_clean <- data_clean %>%
+  mutate(
+    type_jour = ifelse(is_weekend, "weekend", "semaine"),
+    station_jour = paste(FeatureID, type_jour, sep = "_")
+  )
+scores_pca <- scores[, c("station_jour", "Dim.1", "Dim.2")]
+colnames(scores_pca) <- c("station_jour", "PC1", "PC2")
+data_clean <- left_join(data_clean, scores_pca, by = "station_jour")
+
+```
+
+```{r}
+
+data_clean %>%
+  group_by(type_jour, hourUTC1) %>%
+  summarise(mean_count = mean(Count), .groups = "drop") %>%
+  ggplot(aes(x = hourUTC1, y = mean_count, color = type_jour)) +
+  geom_line(linewidth = 1.2) +
+  theme_minimal() +
+  labs(title = "Profil horaire moyen semaine vs weekend", x = "Heure", y = "Comptage")
+```
+
+
+```{r}
+### Clustering et visualisation
+
+# Méthode du coude pour sélectionner le nombre optimal de clusters avec k-means
+data_clust <- scores[, c("Dim.1", "Dim.2")]
+
+wss <- sapply(1:10, function(k){
+  kmeans(data_clust, centers = k, nstart = 20)$tot.withinss
+})
+
+plot(1:10, wss, type = "b", pch = 19, frame = FALSE,
+     xlab = "Nombre de clusters k",
+     ylab = "Somme des carrés intra-classe (WSS)",
+     main = "Méthode du coude")
+```
+
+```{r}
+# Seconde méthode de sélection, méthode de la silhouette 
+library(cluster)
+
+sil_width <- sapply(2:10, function(k){
+  km <- kmeans(data_clust, centers = k, nstart = 20)
+  ss <- silhouette(km$cluster, dist(data_clust))
+  mean(ss[, 3])
+})
+
+plot(2:10, sil_width, type = "b", pch = 19, frame = FALSE,
+     xlab = "Nombre de clusters k",
+     ylab = "Largeur moyenne de silhouette",
+     main = "Méthode de la silhouette")
+```
+
+```{r, fig.width=13, fig.height=7}
+set.seed(123)  # Pour reproductibilité
+# Clustering avec centers = 2
+km_res <- kmeans(profil_scaled, centers = 2, nstart = 25, iter.max = 15)
+
+# Ajout des clusters au tableau scores
+scores$cluster <- as.factor(km_res$cluster)
+
+# Ajout d'une variable combinée cluster - type de jour 
+scores$groupe <- paste0("Cluster ", scores$cluster, " - ", scores$type_jour)
+
+# Définir les couleurs et formes associées à chaque groupe
+my_colors <- c(
+  "Cluster 1 - semaine" = "#1f78b4",
+  "Cluster 1 - weekend" = "#1f78b4",
+  "Cluster 2 - semaine" = "#e31a1c",
+  "Cluster 2 - weekend" = "#e31a1c"
+)
+my_shapes <- c(
+  "Cluster 1 - semaine" = 16, # cercle
+  "Cluster 1 - weekend" = 17, # triangle
+  "Cluster 2 - semaine" = 16,
+  "Cluster 2 - weekend" = 17
+)
+
+# Visualisation des clusters sur l'espace des 2 premières PC
+ggplot(scores, aes(x = Dim.1, y = Dim.2, color = groupe, shape = groupe, label = station_jour)) +
+  geom_point(size = 4, alpha = 0.85) +
+  geom_text(vjust = -1.1, size = 3) +
+  scale_color_manual(values = my_colors) +
+  scale_shape_manual(values = my_shapes) +
+  theme_minimal() +
+  labs(
+    title = "Clustering (k = 2) sur les profils horaires",
+    x = paste0("PC1 (", round(res_pca$eig[1,2], 1), "%)"),
+    y = paste0("PC2 (", round(res_pca$eig[2,2], 1), "%)"),
+    color = "Cluster & Type de jour",
+    shape = "Cluster & Type de jour"
+  )
+
+
+```
+
+```{r, fig.width=13, fig.height=7}
+# --- Clustering optimal avec HCPC ---
+res_pca
+res_hcpc <- HCPC(
+  res_pca,           # objet PCA
+  nb.clust = -1,     # choix automatique du nombre de clusters
+  consol = TRUE,     # consolidation par k-means
+  min = 2, max = 10, # plage du nombre de clusters
+  metric = "euclidean",
+  method = "ward",
+  graph = TRUE       # affiche les graphes HCPC automatiquement
+)
+
+# --- Récupérer la table des clusters pour chaque individu (station_jour) ---
+tableau_clusters <- res_hcpc$data.clust
+tableau_clusters
+# Le nom de la ligne correspond à 'station_jour'
+tableau_clusters$station_jour <- rownames(tableau_clusters)
+
+# --- Fusionner les clusters dans ton jeu de scores pour ggplot ---
+scores <- scores %>%
+  left_join(
+    tableau_clusters %>% select(station_jour, clust),
+    by = "station_jour"
+  ) %>%
+  mutate(
+    cluster = as.factor(clust),  # Pour la couleur/forme
+    groupe = paste0("Cluster ", cluster, " - ", type_jour)
+  )
+
+```
+
+```{r}
+# --- Palette personnalisée (adapte si >2 clusters !) ---
+my_colors <- c(
+  "Cluster 1 - semaine" = "#1f78b4",
+  "Cluster 1 - weekend" = "#1f78b4",
+  "Cluster 2 - semaine" = "#e31a1c",
+  "Cluster 2 - weekend" = "#e31a1c"
+)
+my_shapes <- c(
+  "Cluster 1 - semaine" = 16, # cercle
+  "Cluster 1 - weekend" = 17, # triangle
+  "Cluster 2 - semaine" = 16,
+  "Cluster 2 - weekend" = 17
+)
+
+# --- Visualisation ggplot2, version optimale ---
+ggplot(scores, aes(x = Dim.1, y = Dim.2, color = groupe, shape = groupe, label = station_jour)) +
+  geom_point(size = 4, alpha = 0.85) +
+  scale_color_manual(values = my_colors) +
+  scale_shape_manual(values = my_shapes) +
+  theme_minimal() +
+  theme(
+    plot.margin = unit(c(1, 2.5, 1, 1), "cm")
+  ) +
+  coord_cartesian(
+    xlim = c(min(scores$Dim.1) - 1, max(scores$Dim.1) + 2),
+    ylim = c(min(scores$Dim.2) - 1, max(scores$Dim.2) + 1.5),
+    clip = "off"
+  ) +
+  labs(
+    title = "Clustering (HCPC) sur les profils horaires",
+    x = paste0("PC1 (", round(res_pca$eig[1,2], 1), "%)"),
+    y = paste0("PC2 (", round(res_pca$eig[2,2], 1), "%)"),
+    color = "Cluster & Type de jour",
+    shape = "Cluster & Type de jour"
+  )
+
+```
+
+```{r}
+
+# Interprétation des clusters   
+res_hcpc$desc.ind$quali
+res_hcpc$desc.var
+
+```
+
+```{r}
+
+#### Partie 2 ####
+
+### création de l'environnement et préparation des données avant transfert
+
+# Activer l'environnement AVANT toute utilisation Python
+library(reticulate)
+use_virtualenv("env_CEE016", required = TRUE)
+# Créer un environnement Python persistant (s'il n'existe pas déjà)
+if (virtualenv_exists("env_CEE016")) {
+  use_virtualenv("env_CEE016", required = TRUE)
+  } else {
+  virtualenv_create("env_CEE016")
+  use_virtualenv("env_CEE016", required = TRUE)  
+  py_install( # On installe les packages nécessaires dans cet environnement
+    packages = c("jupyter", "pandas", "numpy", "scikit-learn", "xgboost", "matplotlib", "seaborn","statsmodels"),
+    envname = "env_CEE016",
+    pip = TRUE
+  )
+}
+
+# Vérification 
+py_config() 
+
+# Création d'une clé commune dans scores pour jointure avec data_clean
+scores <- scores %>%
+  mutate(FeatureID = sub("_(semaine|weekend)", "", station_jour),
+         is_weekend = grepl("weekend", station_jour))
+
+# Joindre le cluster à data_clean
+data_clean <- data_clean %>%
+  left_join(scores %>% select(FeatureID, is_weekend, cluster),
+            by = c("FeatureID", "is_weekend"))
+
+# Changer le type de int64 à numeric pour éviter les erreurs de type lors 
+# du transfert dans Python avec Reticulate
+data_clean$Count = as.numeric(data_clean$Count)
+r_to_py_data <- as.data.frame(data_clean)
+head(r_to_py_data)
+```
+
+```{python}
+###  Vérification et mise en place de l'environnement python
+
+import sys
+import pkg_resources
+
+# Liste des packages installés
+installed = [pkg.key for pkg in pkg_resources.working_set]
+print(installed)
+
+# Importer les packages nécessaires
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+
+from xgboost import XGBRegressor, plot_importance
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error, mean_poisson_deviance
+
+print("✅ Environnement Python prêt.")
+
+
+```
+
+```{python}
+
+### Accéder aux données depuis l'environnement R  
+
+# Transfert des données via Reticulate
+df = r.r_to_py_data
+
+# Aperçu du df
+print(df.shape)
+df.head()
+df['Count']
+# vérifier les types de nos colonnes 
+df.dtypes
+
+#  A faire dans R pour éviter les problèmes de conversion avec Reticulate
+df["Count"] = df["Count"].astype(int)
+
+```
+
+```{python}
+# On constate une distribution très asymétrique (transfo en log reconommandée)
+plt.figure(figsize=(8, 4))
+sns.histplot(df["Count"], bins=30, kde=True)
+plt.title("Distribution des valeurs de 'Count'")
+plt.xlabel("Count")
+plt.ylabel("Fréquence")
+plt.tight_layout()
+plt.show()
+# Statistiques descriptives
+
+print("\n=== Statistiques descriptives globales ===")
+print(df["Count"].describe())
+
+print("\n=== Valeurs les plus fréquentes ===")
+print(df["Count"].value_counts().head())
+
+```
+
+```{python}
+### Regression linéaire 
+
+# Transformer FeatureID et hour
+df["FeatureID"]    = df["FeatureID"].astype("category")
+df["hourUTC1"]     = df["hourUTC1"].astype(int)
+
+# Modèle: météo + effets fixes (heure, jour, station)
+modele1 = (
+    "Count ~ Speed + Ta_ucc + wind_speed_ucc + press_ucc + "
+    "cloud_ucc + rain_ucc + solar_bxl + C(hourUTC1) + C(jour_semaine) + C(FeatureID)"
+)
+
+# OLS (intercept ajouté automatiquement) + SE clusterisées par station
+modele_simple = smf.ols(modele1, data=df).fit(
+    cov_type="cluster", cov_kwds={"groups": df["FeatureID"]}
+)
+print(modele_simple.summary())
+
+# Résidus et valeurs ajustées (hétéroscédasticité)
+residuals   = modele_simple.resid
+fitted_vals = modele_simple.fittedvalues
+
+plt.figure(figsize=(8, 4))
+sns.scatterplot(x=fitted_vals, y=residuals, alpha=0.2, s=5)
+plt.axhline(0, color='red', linestyle='--')
+plt.title("Résidus vs Valeurs Prédites")
+plt.xlabel("Valeurs prédites")
+plt.ylabel("Résidus")
+plt.show()
+
+```
+
+```{python}
+# Normalité des résidus (qqplot)
+sm.qqplot(modele_simple.resid, line="s")
+plt.title("Q–Q plot des résidus")
+plt.show()
+
+```
+
+```{python}
+
+# Modèle transformé
+# log(Count + 1) pour éviter le log(0)
+# mêmes variables explicatives (heure catégorielle, jour, station)
+modele2 = (
+    "np.log1p(Count) ~ Speed + Ta_ucc + wind_speed_ucc + press_ucc + "
+    "cloud_ucc + rain_ucc + solar_bxl + C(hourUTC1) + C(jour_semaine) + C(FeatureID)"
+)
+
+modele_log = smf.ols(modele2, data=df).fit(
+    cov_type="cluster", cov_kwds={"groups": df["FeatureID"]}
+)
+print(modele_log.summary())
+
+# Résidus & prédictions (log puis retour à l'échelle des comptes)
+df["residuals_log"] = modele_log.resid
+df["fitted_vals_log"] = modele_log.fittedvalues               # sur l'échelle log
+df["Count_regression"] = np.expm1(df["fitted_vals_log"]).clip(lower=0)
+```
+
+```{python}
+# Hétéroscédasticité réduite
+plt.figure(figsize=(8, 4))
+sns.scatterplot(x=df['fitted_vals_log'], y=df['residuals_log'], alpha=0.2, s=5)
+plt.axhline(0, color='red', linestyle='--')
+plt.title("Résidus vs Valeurs Prédites")
+plt.xlabel("Valeurs prédites")
+plt.ylabel("Résidus")
+plt.show()
+
+```
+
+```{python}
+# Normalité des résidus 
+sm.qqplot(modele_log.resid, line="s")
+plt.title("Q–Q plot des résidus")
+plt.show()
+
+```
+
+```{python}
+# création du modèle XGBoost
+
+# Ajout de variables pertinentes (mois, interactions)
+df["month"] = df["date"].dt.month
+
+# Changer le type de la variable is_weekend 
+df["is_weekend"] = df["is_weekend"].astype(int) 
+
+df["jour_semaine"] = df["jour_semaine"].astype("category")
+
+# Sélection des variables explicatives et de la variable cible pour XGBoost
+X = df[["month","Speed", "Ta_ucc", "wind_speed_ucc", "press_ucc", "cloud_ucc", "rain_ucc", "solar_bxl","is_weekend","hourUTC1", "FeatureID", "jour_semaine"]].copy()
+y = df["Count"]
+
+# Découpage Train/Test
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Modèle XGBoost
+model_xgb = XGBRegressor(objective = "count:poisson",n_estimators=300, learning_rate=0.1, max_depth=4, subsample=0.8, colsample_bytree=0.8, reg_lambda=1, random_state=42, enable_categorical=True)
+model_xgb.fit(X_train, y_train)
+
+# Prédictions
+y_pred = model_xgb.predict(X_test)
+
+# Évaluation
+mse = mean_squared_error(y_test, y_pred)
+r2 = r2_score(y_test, y_pred)
+mae = mean_absolute_error(y_test, y_pred)
+p_dev = mean_poisson_deviance(y_test, y_pred)
+
+print(f" MSE : {mse:.2f}")
+print(f" R2 : {r2:.2f}")
+print(f"MAE (counts)   : {mae:,.2f}")
+print(f"Poisson deviance (moy) : {p_dev:,.2f}") # Plus petit = mieux
+
+# Prédictions pour l'ensemble du df
+df['Count_xgboost'] = model_xgb.predict(X)
+
+
+# Vérification des valeurs négatives (0% avec poisson vs 14% avec mean_squared)
+negatifs = (df['Count_xgboost'] < 0).sum()
+total = len(df)
+pourcentage = 100 * negatifs / total
+print(f"Valeurs négatives : {negatifs} sur {total} ({pourcentage:.2f}%)")
+
+```
+
+```{python}
+### Visualisation des résultats XGBoost
+
+resid = y_test - y_pred
+plt.figure(figsize=(7,4))
+plt.scatter(y_pred, resid, s=5, alpha=0.3)
+plt.axhline(0, ls='--', c='r'); plt.xlabel("Prédit")
+plt.ylabel("Résidu")
+plt.title("Résidus vs valeurs prédites")
+plt.show()
+
+
+plt.figure(figsize=(6,6))
+plt.hexbin(y_test, y_pred, gridsize=60, bins='log')
+m = max(y_test.max(), y_pred.max())
+plt.plot([0,m],[0,m],'r--')
+plt.xlabel("Réel")
+plt.ylabel("Prédit")
+plt.title("XGBoost Poisson – Réel vs Prédit (densité)")
+plt.colorbar()
+plt.show()
+
+```
+
+```{python}
+# Montrer l'importance des prédicteurs dans le modèle XGBoost
+plot_importance(model_xgb, importance_type='gain', max_num_features=20, show_values =False)
+plt.title("Importance des variables (gain)")
+plt.show()
+
+```
+
+```{python}
+print(df.columns.tolist())
+df.dtypes
+
+
+df["FeatureID"]    = df["FeatureID"].astype(str)
+df["cluster"]      = df["cluster"].astype(str)
+df["jour_semaine"] = df["jour_semaine"].astype(str)
+
+# Marqueur train / test (indices de X_test)
+df["split"] = "train"
+df.loc[X_test.index, "split"] = "test"
+
+
+# df à exporter
+df_export = df[[
+    "FeatureID","DateUTC1","jour_semaine","hourUTC1","month","is_weekend","split",
+    "Count","Count_xgboost","Speed","Ta_ucc","wind_speed_ucc","press_ucc","cloud_ucc",
+    "rain_ucc","solar_bxl","cluster"
+]]
+
+
+# Export CSV 
+df_export.to_csv("bike.csv", index=False)
+print(f"Export -> bike.csv | lignes: {len(df_export):,} | colonnes: {len(df_export.columns)}")
+
+```
+
+
