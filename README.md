@@ -1,4 +1,4 @@
-# MOBIGIS_traffic_analysis
+# MOBIGIS_trafic_analysis
 Analyse (en R et Python) des 18 stations de comptage vélo à Bruxelles (2024) pour comprendre les profils d’usage et prédire le traffic. Résultats explorés dans un dashboard Power BI. ACP · Clustering · OLS · XGBoost · Power BI
 Accès à la base de données
 
